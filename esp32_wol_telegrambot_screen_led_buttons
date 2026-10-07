@@ -1,0 +1,1437 @@
+/*
+  ESP32 WoL Bot (Telegram) + OLED SSD1306 + LED WS2812 + 3 botoes + menu
+
+  BOTOES (todos disparam ao apertar; Up/Down repetem ao segurar)
+    UP   (GPIO 26)  mover para cima / ajustar +
+    DOWN (GPIO 25)  mover para baixo / ajustar -
+    OK   (GPIO 32)  entrar / confirmar / escolher botao na tela
+
+  TELA INICIAL:  UP = Soft WoL (com confirmacao)   DOWN = ping   OK = menu
+  MENUS:         o ultimo item e sempre "< Voltar" (adicionado automaticamente)
+  EDICAO:        valor -> [Salvar] -> [Cancelar]   (OK avanca o foco)
+  CONFIRMACAO:   [Nao] [Sim], o foco comeca em Nao
+
+  ============================================================
+  COMO ACRESCENTAR COISAS (o codigo foi organizado para isso)
+  ============================================================
+
+  1) NOVO ITEM EM UM MENU EXISTENTE
+     Va na tabela do menu (secao "TABELAS DO MENU") e acrescente UMA linha:
+       M_SUB (rotulo, menu)                      abre um submenu
+       M_ACT (rotulo, funcao, CONF_xxx, msg)     executa uma funcao void f()
+       M_SCR (rotulo, SCR_xxx)                   abre uma tela customizada
+       M_TGL (rotulo, cfg.campo, onChange)       liga/desliga (SIM/NAO) direto
+       M_NUM (rotulo, cfg.campo, min, max, passo, "un", onChange)
+       M_CHO (rotulo, cfg.campo, vetor_de_textos, onChange)
+       M_INF (funcao_que_retorna_String)         linha so de leitura
+     CONF_NONE = executa direto | CONF_ASK = tela de confirmacao [Nao] [Sim]
+     (O item "< Voltar" NAO precisa ser escrito: o motor o acrescenta.)
+
+  2) NOVA CONFIGURACAO PERSISTENTE
+     a) acrescente o campo na struct Settings e o valor em CFG_DEFAULT
+     b) MUDE o numero de CFG_MAGIC (para descartar a config antiga da flash)
+     c) acrescente uma linha M_TGL / M_NUM / M_CHO no menu
+
+  3) NOVO SUBMENU
+     Crie o vetor de itens + a struct Menu (copie um existente) e
+     declare "extern const Menu menuXxx;" na lista de declaracoes antecipadas.
+
+  4) NOVA TELA CUSTOMIZADA
+     a) acrescente SCR_XXX no enum ScreenId (antes de SCR_COUNT)
+     b) escreva titleXxx(), drawXxx() e keyXxx(Key k)
+     c) acrescente uma linha na tabela SCREENS
+     d) (opcional) crie um item M_SCR no menu para abri-la
+*/
+
+// Debug da biblioteca do Telegram (descomente se precisar diagnosticar).
+// Deve ficar ANTES do include da UniversalTelegramBot.
+// #define TELEGRAM_DEBUG 1
+
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <WiFiClientSecure.h>
+#include <WiFiUdp.h>
+#include <WakeOnLan.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+#include <ESPping.h>
+#include <Preferences.h>
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_NeoPixel.h>
+
+#define FW_VERSION "5.0"
+
+// ===== PREENCHA COM SEUS DADOS =====
+#define BOT_TOKEN "0000000000:ABCdefghjkliop1234567890RSTUvwxyzab"
+#define ALLOWED_ID "0000000000"
+
+#define MAC_ADDR "00:00:00:00:00:00"
+#define PC_IP "10.10.0.2"
+
+// Rede do portal de configuracao. Com 8+ caracteres em AP_PASS, o portal fica protegido.
+#define AP_NAME "ESP32_WoL_Bot"
+#define AP_PASS ""
+// ===================================
+
+// --- Pinos ---
+#define HARD_WOL_PIN 4
+#define HARD_WOL_ACTIVE_LEVEL HIGH   // use LOW se o modulo de rele acionar com nivel baixo
+
+#define OLED_SDA 21
+#define OLED_SCL 22
+#define LED_PIN 14
+#define LED_COUNT 1
+
+#define BTN_UP_PIN   26
+#define BTN_OK_PIN   32
+#define BTN_DOWN_PIN 25
+
+// --- OLED ---
+#define SCREEN_W 128
+#define SCREEN_H 64
+#define OLED_ADDR 0x3C   // se nao funcionar, tente 0x3D
+
+#define MAX_COLS 21
+#define MAX_LINES 7      // linhas do log (a linha 0 e o cabecalho)
+#define MENU_ROWS 6      // itens visiveis por vez (linha 7 e o rodape)
+#define MENU_TIMEOUT_MS 30000UL  // volta para a tela inicial apos 30 s sem tocar nos botoes
+
+// =====================================================
+//  TIPOS (mantenha antes da primeira funcao)
+// =====================================================
+
+enum Key : uint8_t { K_NONE, K_UP, K_DOWN, K_OK };
+
+enum ItemType : uint8_t { IT_SUBMENU, IT_ACTION, IT_SCREEN, IT_TOGGLE, IT_NUMBER, IT_CHOICE, IT_INFO };
+
+enum ConfirmType : uint8_t { CONF_NONE, CONF_ASK };
+
+// Telas. Para criar outra: acrescente aqui (antes de SCR_COUNT) e na tabela SCREENS.
+enum ScreenId : uint8_t { SCR_HOME, SCR_STATUS, SCR_MENU, SCR_EDIT, SCR_CONFIRM, SCR_COUNT };
+
+struct Menu;
+
+struct MenuItem {
+  const char* label;
+  ItemType type;
+  const Menu* submenu;        // IT_SUBMENU
+  void (*action)();           // IT_ACTION
+  uint8_t screen;             // IT_SCREEN
+  int* value;                 // IT_TOGGLE / IT_NUMBER / IT_CHOICE
+  int minV, maxV, step;       // IT_NUMBER
+  const char* unit;           // IT_NUMBER
+  const char* const* choices; // IT_CHOICE
+  uint8_t nChoices;           // IT_CHOICE
+  void (*onChange)();         // chamada ao alterar o valor (aplica na hora)
+  ConfirmType confirm;        // IT_ACTION
+  const char* confirmMsg;     // texto da tela de confirmacao
+  String (*info)();           // IT_INFO
+};
+
+struct Menu {
+  const char* title;
+  const MenuItem* items;
+  uint8_t count;              // sem contar o "< Voltar" automatico
+};
+
+struct Nav { const Menu* m; uint8_t cur; uint8_t top; };
+
+struct ScreenDef {
+  String (*title)();
+  void (*draw)();
+  void (*onKey)(Key k);
+};
+
+struct Btn {
+  uint8_t pin;
+  Key key;
+  bool repeat;
+  bool raw;
+  bool stable;
+  unsigned long tChange;
+  unsigned long tPress;
+  unsigned long tRep;
+};
+
+struct Settings {
+  uint32_t magic;
+  int ledOn;
+  int ledBright;     // 1-100 (%)
+  int ledBreathe;
+  int ledQuiet;      // modo silencioso: mensagens nao piscam o LED
+  int oledContrast;  // 0-255
+  int oledTimeout;   // indice em OLED_TIMEOUT_MS
+  int hardPulse;     // ms
+  int botInterval;   // s
+  int restartIdx;    // indice em RESTART_MS
+};
+
+// Mude este numero sempre que alterar a struct Settings
+const uint32_t CFG_MAGIC = 0x57D00401;
+//                                    magic     led br  resp quiet contr  oledTO pulso bot rst
+const Settings CFG_DEFAULT = { CFG_MAGIC, 1,  6,  1,   0,    207,   3,     500,  5,   1 };
+Settings cfg = CFG_DEFAULT;
+
+const char* const CH_OLED_TIMEOUT[] = {"30s", "1min", "5min", "15min", "30min", "Nunca"};
+const unsigned long OLED_TIMEOUT_MS[] = {30000UL, 60000UL, 300000UL, 900000UL, 1800000UL, 0UL}; // padrao: indice 3 = 15 min
+const char* const CH_RESTART[] = {"1h", "4h", "12h", "24h", "Nunca"};
+const unsigned long RESTART_MS[] = {3600000UL, 14400000UL, 43200000UL, 86400000UL, 0UL};
+
+// =====================================================
+//  OBJETOS GLOBAIS
+// =====================================================
+
+WiFiClientSecure secured_client;
+WiFiUDP UDP;
+WakeOnLan WOL(UDP);
+UniversalTelegramBot bot(BOT_TOKEN, secured_client);
+unsigned long bot_lasttime;
+
+Preferences prefs;
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
+Adafruit_NeoPixel led(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+bool oledOk = false;
+bool displayAwake = true;
+unsigned long lastActivity = 0;   // ultimo toque/evento (para apagar o OLED)
+unsigned long lastKeyTime = 0;    // ultimo toque (para voltar a tela inicial)
+
+String logLines[MAX_LINES];
+String oledHeader = "IP: ---";
+
+// Estado do PC e ultimo comando
+int8_t pcState = -1;              // -1 desconhecido, 0 offline, 1 online
+unsigned long lastPingTime = 0;
+String lastCmd = "-";
+unsigned long lastCmdTime = 0;
+
+// Estado da interface
+uint8_t curScreen = SCR_HOME;
+Nav navStack[5];
+int navDepth = 0;
+
+bool editing = false;             // true enquanto a tela SCR_EDIT esta ativa
+int editBackup = 0;
+uint8_t editFocus = 0;            // 0 = valor, 1 = [Salvar], 2 = [Cancelar]
+const MenuItem* editItem = nullptr;
+
+String cfmL1, cfmL2;
+void (*cfmYes)() = nullptr;
+uint8_t cfmFocus = 0;             // 0 = [Nao], 1 = [Sim]
+uint8_t cfmReturn = SCR_HOME;
+
+String noticeText;
+bool noticeActive = false;
+unsigned long noticeUntil = 0;
+
+Btn buttons[] = {
+  { BTN_UP_PIN,   K_UP,   true,  false, false, 0, 0, 0 },
+  { BTN_DOWN_PIN, K_DOWN, true,  false, false, 0, 0, 0 },
+  { BTN_OK_PIN,   K_OK,   false, false, false, 0, 0, 0 },
+};
+
+void uiRedraw();   // declarada aqui; definida junto da tabela SCREENS
+
+// =====================================================
+//  CONFIGURACOES (memoria nao volatil)
+// =====================================================
+
+void saveSettings()
+{
+  prefs.begin("wolbot", false);
+  prefs.putBytes("cfg", &cfg, sizeof(cfg));
+  prefs.end();
+}
+
+void loadSettings()
+{
+  Settings tmp;
+  prefs.begin("wolbot", false);
+  size_t n = prefs.getBytes("cfg", &tmp, sizeof(tmp));
+  prefs.end();
+  if (n == sizeof(tmp) && tmp.magic == CFG_MAGIC) cfg = tmp;
+}
+
+// =====================================================
+//  LED WS2812
+// =====================================================
+//  Cores:
+//   AZUL fixo -> iniciando | AMARELO fixo -> conectando Wi-Fi
+//   ROXO fixo -> portal Wi-Fi aberto | CIANO fixo -> NTP / checando ping
+//   VERDE respirando -> online | VERMELHO respirando -> Wi-Fi caiu
+//   BRANCO piscada -> mensagem recebida
+//   AZUL 3 piscadas -> Soft WoL | LARANJA 3 piscadas -> Hard WoL
+//   VERDE/VERMELHO fixo 5 s -> PC online/offline
+//   VERMELHO 3 piscadas -> acesso negado | AMARELO 2 piscadas -> comando invalido
+//  Modo silencioso: so eventos "informativos" ficam mudos. Acesso negado,
+//  Wi-Fi caido e falhas continuam avisando.
+// =====================================================
+
+const uint32_t C_RED    = Adafruit_NeoPixel::Color(255, 0, 0);
+const uint32_t C_GREEN  = Adafruit_NeoPixel::Color(0, 255, 0);
+const uint32_t C_BLUE   = Adafruit_NeoPixel::Color(0, 0, 255);
+const uint32_t C_YELLOW = Adafruit_NeoPixel::Color(255, 150, 0);
+const uint32_t C_ORANGE = Adafruit_NeoPixel::Color(255, 50, 0);
+const uint32_t C_CYAN   = Adafruit_NeoPixel::Color(0, 255, 255);
+const uint32_t C_PURPLE = Adafruit_NeoPixel::Color(150, 0, 255);
+const uint32_t C_WHITE  = Adafruit_NeoPixel::Color(255, 255, 255);
+const uint32_t C_OFF    = 0;
+
+uint32_t holdColor = 0;
+unsigned long holdUntil = 0;
+
+void applyLed()
+{
+  led.setBrightness((uint8_t)((cfg.ledBright * 255) / 100));
+}
+
+void ledShow(uint32_t color)
+{
+  if (!cfg.ledOn) color = 0;
+  for (int i = 0; i < LED_COUNT; i++) led.setPixelColor(i, color);
+  led.show();
+}
+
+void ledFlash(uint32_t color, int times, int onMs = 120, int offMs = 120)
+{
+  for (int i = 0; i < times; i++)
+  {
+    ledShow(color);
+    delay(onMs);
+    ledShow(C_OFF);
+    if (i < times - 1) delay(offMs);
+  }
+}
+
+void ledHold(uint32_t color, unsigned long ms)
+{
+  holdColor = color;
+  holdUntil = millis() + ms;
+  ledShow(color);
+}
+
+// Versoes "informativas": ficam mudas no modo silencioso
+void ledInfoShow(uint32_t color)  { if (!cfg.ledQuiet) ledShow(color); }
+void ledInfoFlash(uint32_t color, int times, int onMs = 120, int offMs = 120) { if (!cfg.ledQuiet) ledFlash(color, times, onMs, offMs); }
+void ledInfoHold(uint32_t color, unsigned long ms) { if (!cfg.ledQuiet) ledHold(color, ms); }
+
+uint32_t ledScale(uint32_t c, uint8_t k)
+{
+  uint8_t r = (c >> 16) & 0xFF;
+  uint8_t g = (c >> 8) & 0xFF;
+  uint8_t b = c & 0xFF;
+  return Adafruit_NeoPixel::Color((r * k) / 255, (g * k) / 255, (b * k) / 255);
+}
+
+void ledUpdate()
+{
+  if (holdUntil != 0)
+  {
+    if ((long)(millis() - holdUntil) < 0) return;
+    holdUntil = 0;
+  }
+
+  uint32_t base = (WiFi.status() == WL_CONNECTED) ? C_GREEN : C_RED;
+  uint8_t k;
+  if (cfg.ledBreathe)
+  {
+    float phase = (millis() % 4000) / 4000.0f;
+    float level = (sinf(2.0f * PI * phase - PI / 2.0f) + 1.0f) / 2.0f;
+    k = 8 + (uint8_t)(72 * level);
+  }
+  else
+  {
+    k = 40;
+  }
+  ledShow(ledScale(base, k));
+}
+
+// Chamadas quando o usuario altera valores no menu (mostra o efeito na hora)
+void onLedChange()
+{
+  applyLed();
+  ledHold(C_GREEN, 1500);
+}
+
+// =====================================================
+//  DISPLAY: primitivas
+// =====================================================
+
+void applyOled()
+{
+  if (!oledOk) return;
+  display.ssd1306_command(SSD1306_SETCONTRAST);
+  display.ssd1306_command((uint8_t)cfg.oledContrast);
+}
+
+void onOledChange() { applyOled(); }
+
+void oledSleep()
+{
+  if (!oledOk || !displayAwake) return;
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+  displayAwake = false;
+}
+
+void oledWake()
+{
+  lastActivity = millis();
+  if (!oledOk || displayAwake) return;
+  display.ssd1306_command(SSD1306_DISPLAYON);
+  displayAwake = true;
+}
+
+// Remove acentos/emojis (a fonte padrao so tem ASCII)
+String toAscii(const String &s)
+{
+  String out;
+  for (unsigned int i = 0; i < s.length(); i++)
+  {
+    if ((uint8_t)s[i] < 128) out += s[i];
+  }
+  out.trim();
+  return out;
+}
+
+// Escreve uma linha de texto (row 0..7). inv = true -> faixa branca, texto preto
+void uiRow(int row, const String &t, bool inv)
+{
+  int y = row * 8;
+  String s = t.substring(0, MAX_COLS);
+  if (inv)
+  {
+    display.fillRect(0, y, SCREEN_W, 8, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setCursor(1, y);
+  }
+  else
+  {
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, y);
+  }
+  display.print(s);
+  display.setTextColor(SSD1306_WHITE);
+}
+
+void uiFooter(const char *s)
+{
+  uiRow(7, String(s), false);
+}
+
+// Botao na tela, ex.: "[Salvar]". Com foco, fica em video invertido.
+void uiButton(int x, int y, const char *t, bool focused)
+{
+  int w = strlen(t) * 6;
+  if (focused)
+  {
+    display.fillRect(x - 2, y - 1, w + 4, 10, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+  }
+  else
+  {
+    display.setTextColor(SSD1306_WHITE);
+  }
+  display.setCursor(x, y);
+  display.print(t);
+  display.setTextColor(SSD1306_WHITE);
+}
+
+// Aviso de uma linha por cima da tela atual (nao aparece na tela inicial, que ja e o log)
+void uiNotice(const String &msg)
+{
+  noticeText = msg;
+  noticeActive = true;
+  noticeUntil = millis() + 2500;
+}
+
+// Log: guarda nas linhas da tela inicial e no Serial
+void oledLog(String msg)
+{
+  msg = toAscii(msg);
+  if (msg.length() == 0) return;
+  Serial.println(msg);
+  oledWake();
+
+  String note = msg;
+  while (msg.length() > 0)
+  {
+    String part = msg.substring(0, MAX_COLS);
+    msg = msg.substring(part.length());
+    for (int i = 0; i < MAX_LINES - 1; i++) logLines[i] = logLines[i + 1];
+    logLines[MAX_LINES - 1] = part;
+  }
+
+  if (curScreen != SCR_HOME) uiNotice(note);
+  uiRedraw();
+}
+
+// Envia no Telegram (com emojis/acentos) e registra no display (texto simples)
+void reply(const String &chat_id, const String &tgMsg, const String &oledMsg, const String &parse = "")
+{
+  bot.sendMessage(chat_id, tgMsg, parse);
+  oledLog("TX: " + oledMsg);
+}
+
+void tgNotify(const String &msg)
+{
+  if (WiFi.status() == WL_CONNECTED) bot.sendMessage(ALLOWED_ID, msg, "");
+}
+
+// =====================================================
+//  BOTOES
+// =====================================================
+
+Key pollButtons()
+{
+  unsigned long now = millis();
+  for (auto &b : buttons)
+  {
+    bool raw = (digitalRead(b.pin) == LOW);
+    if (raw != b.raw) { b.raw = raw; b.tChange = now; }
+
+    if (now - b.tChange >= 30 && raw != b.stable)
+    {
+      b.stable = raw;
+      if (raw)
+      {
+        b.tPress = now;
+        b.tRep = now;
+        return b.key;                                      // dispara ao apertar
+      }
+    }
+
+    if (b.stable && b.repeat && now - b.tPress > 500 && now - b.tRep > 120)
+    {
+      b.tRep = now;
+      return b.key;                                        // auto-repeticao ao segurar
+    }
+  }
+  return K_NONE;
+}
+
+// =====================================================
+//  ACOES DE HARDWARE
+// =====================================================
+
+const uint8_t HARD_IDLE_LEVEL = (HARD_WOL_ACTIVE_LEVEL == HIGH) ? LOW : HIGH;
+
+void sendWolSoft()
+{
+  oledLog("Enviando Magic Packet");
+  ledInfoShow(C_BLUE);
+  WOL.sendMagicPacket(MAC_ADDR);
+  delay(300);
+  ledInfoFlash(C_BLUE, 3);
+  ledInfoHold(C_BLUE, 2000);
+}
+
+void sendWolHard()
+{
+  oledLog("Acionando Hard WoL");
+  ledInfoShow(C_ORANGE);
+  digitalWrite(HARD_WOL_PIN, HARD_WOL_ACTIVE_LEVEL);
+  delay(cfg.hardPulse);
+  digitalWrite(HARD_WOL_PIN, HARD_IDLE_LEVEL);
+  ledInfoFlash(C_ORANGE, 3);
+  ledInfoHold(C_ORANGE, 2000);
+}
+
+// Faz o ping, atualiza estado e LED. Nao escreve no log (quem chama decide).
+bool pingPc()
+{
+  ledInfoShow(C_CYAN);
+  bool ok = Ping.ping(PC_IP, 3);
+  pcState = ok ? 1 : 0;
+  lastPingTime = millis();
+  ledInfoHold(ok ? C_GREEN : C_RED, 5000);
+  return ok;
+}
+
+// =====================================================
+//  ACOES DO PAINEL LOCAL (usadas pelo menu e pelos atalhos)
+// =====================================================
+
+void actionSoftWol()
+{
+  lastCmd = "Soft WoL local";
+  lastCmdTime = millis();
+  sendWolSoft();
+  oledLog("TX: Soft WoL");
+  tgNotify("🪄 Soft WoL enviado (pelo painel local)");
+}
+
+void actionHardWol()
+{
+  lastCmd = "Hard WoL local";
+  lastCmdTime = millis();
+  sendWolHard();
+  oledLog("TX: Hard WoL");
+  tgNotify("⚡ Hard WoL acionado (pelo painel local)");
+}
+
+void actionPing()
+{
+  lastCmd = "Ping local";
+  lastCmdTime = millis();
+  oledLog("Checando PC...");
+  bool ok = pingPc();
+  oledLog(ok ? "PC ONLINE" : "PC OFFLINE");
+  tgNotify(ok ? "✅ PC ONLINE (painel local)" : "❌ PC OFFLINE (painel local)");
+}
+
+void gotoScreen(uint8_t id);
+
+const char *apPass() { return (strlen(AP_PASS) >= 8) ? AP_PASS : NULL; }
+
+void onApOpen(WiFiManager *w)
+{
+  ledShow(C_PURPLE);
+  oledLog("Config WiFi:");
+  oledLog("AP " AP_NAME);
+  if (apPass()) oledLog(String("Senha: ") + AP_PASS);
+  oledLog("IP 192.168.4.1");
+}
+
+void actionReboot()
+{
+  gotoScreen(SCR_HOME);
+  oledLog("Reiniciando...");
+  ledFlash(C_PURPLE, 2);
+  delay(300);
+  ESP.restart();
+}
+
+void actionPortal()
+{
+  gotoScreen(SCR_HOME);
+  oledLog("Abrindo portal WiFi");
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(180);
+  wm.setAPCallback(onApOpen);
+  wm.startConfigPortal(AP_NAME, apPass());
+  ESP.restart();   // volta limpo, com a rede (nova ou antiga)
+}
+
+void actionEraseWifi()
+{
+  gotoScreen(SCR_HOME);
+  oledLog("Apagando WiFi...");
+  WiFiManager wm;
+  wm.resetSettings();
+  delay(500);
+  ESP.restart();   // sem rede salva, abre o portal
+}
+
+void actionRestoreDefaults()
+{
+  cfg = CFG_DEFAULT;
+  saveSettings();
+  applyLed();
+  applyOled();
+  oledLog("Padroes restaurados");
+  ledHold(C_GREEN, 1500);
+}
+
+// =====================================================
+//  LINHAS DE INFORMACAO (usadas por M_INF)
+// =====================================================
+
+String agoStr(unsigned long t)
+{
+  if (t == 0) return "nunca";
+  unsigned long s = (millis() - t) / 1000;
+  if (s < 60) return String(s) + "s atras";
+  if (s < 3600) return String(s / 60) + "min atras";
+  return String(s / 3600) + "h atras";
+}
+
+String durStr(unsigned long s)
+{
+  unsigned long d = s / 86400; s %= 86400;
+  unsigned long h = s / 3600;  s %= 3600;
+  unsigned long m = s / 60;
+  if (d) return String(d) + "d " + String(h) + "h";
+  if (h) return String(h) + "h " + String(m) + "m";
+  return String(m) + "m " + String(s % 60) + "s";
+}
+
+String pcStateStr()
+{
+  if (pcState == 1) return "ONLINE";
+  if (pcState == 0) return "OFFLINE";
+  return "desconhecido";
+}
+
+String infoIP()       { return "IP: " + WiFi.localIP().toString(); }
+String infoSSID()     { return "SSID: " + WiFi.SSID(); }
+String infoRSSI()     { return "Sinal: " + String(WiFi.RSSI()) + " dBm"; }
+String infoPcState()  { return "PC: " + pcStateStr(); }
+String infoPcPing()   { return "Ping: " + agoStr(lastPingTime); }
+String infoLastCmd()  { return "Cmd: " + lastCmd; }
+String infoUptime()   { return "Ligado: " + durStr(millis() / 1000); }
+String infoHeap()     { return "Mem livre: " + String(ESP.getFreeHeap() / 1024) + "KB"; }
+String infoVersion()  { return String("Versao: ") + FW_VERSION; }
+
+// =====================================================
+//  TABELAS DO MENU  (e aqui que voce acrescenta itens)
+// =====================================================
+
+#define M_SUB(lbl, menu)  { lbl, IT_SUBMENU, &menu, nullptr, 0, nullptr, 0, 0, 0, nullptr, nullptr, 0, nullptr, CONF_NONE, nullptr, nullptr }
+#define M_ACT(lbl, fn, conf, msg) { lbl, IT_ACTION, nullptr, fn, 0, nullptr, 0, 0, 0, nullptr, nullptr, 0, nullptr, conf, msg, nullptr }
+#define M_SCR(lbl, id)    { lbl, IT_SCREEN, nullptr, nullptr, id, nullptr, 0, 0, 0, nullptr, nullptr, 0, nullptr, CONF_NONE, nullptr, nullptr }
+#define M_TGL(lbl, var, chg) { lbl, IT_TOGGLE, nullptr, nullptr, 0, &var, 0, 1, 1, nullptr, nullptr, 0, chg, CONF_NONE, nullptr, nullptr }
+#define M_NUM(lbl, var, mn, mx, st, un, chg) { lbl, IT_NUMBER, nullptr, nullptr, 0, &var, mn, mx, st, un, nullptr, 0, chg, CONF_NONE, nullptr, nullptr }
+#define M_CHO(lbl, var, arr, chg) { lbl, IT_CHOICE, nullptr, nullptr, 0, &var, 0, 0, 1, nullptr, arr, sizeof(arr) / sizeof(arr[0]), chg, CONF_NONE, nullptr, nullptr }
+#define M_INF(fn)         { nullptr, IT_INFO, nullptr, nullptr, 0, nullptr, 0, 0, 0, nullptr, nullptr, 0, nullptr, CONF_NONE, nullptr, fn }
+
+// Declaracoes antecipadas (permitem um menu apontar para outro)
+extern const Menu menuMain;
+extern const Menu menuPc;
+extern const Menu menuCfg;
+extern const Menu menuLed;
+extern const Menu menuDisplay;
+extern const Menu menuHard;
+extern const Menu menuTg;
+extern const Menu menuSys;
+extern const Menu menuStatus;
+extern const Menu menuNet;
+extern const Menu menuPcInfo;
+extern const Menu menuSysInfo;
+extern const Menu menuMaint;
+
+// --- MENU PRINCIPAL ---
+const MenuItem itemsMain[] = {
+  M_SUB("Controle do PC",  menuPc),
+  M_SUB("Configuracoes",   menuCfg),
+  M_SUB("Status",          menuStatus),
+  M_SUB("Manutencao",      menuMaint),
+};
+
+// --- CONTROLE DO PC ---
+const MenuItem itemsPc[] = {
+  M_ACT("Ligar (Soft WoL)", actionSoftWol, CONF_NONE, nullptr),
+  M_ACT("Ligar (Hard WoL)", actionHardWol, CONF_ASK,  "Aciona o rele do PC"),
+  M_ACT("Status (ping)",    actionPing,    CONF_NONE, nullptr),
+  // Reset / desligamento forcado: so entram se houver um 2o rele
+};
+
+// --- CONFIGURACOES ---
+const MenuItem itemsCfg[] = {
+  M_SUB("LED",      menuLed),
+  M_SUB("Display",  menuDisplay),
+  M_SUB("Hard WoL", menuHard),
+  M_SUB("Telegram", menuTg),
+  M_SUB("Sistema",  menuSys),
+};
+
+const MenuItem itemsLed[] = {
+  M_TGL("LED ligado",      cfg.ledOn,      onLedChange),
+  M_NUM("Brilho",          cfg.ledBright,  1, 100, 1, "%", onLedChange),
+  M_TGL("Respiracao",      cfg.ledBreathe, onLedChange),
+  M_TGL("Modo silencioso", cfg.ledQuiet,   nullptr),
+};
+
+const MenuItem itemsDisplay[] = {
+  M_NUM("Contraste",    cfg.oledContrast, 0, 255, 5, "", onOledChange),
+  M_CHO("Apagar apos",  cfg.oledTimeout,  CH_OLED_TIMEOUT, nullptr),
+};
+
+const MenuItem itemsHard[] = {
+  M_NUM("Pulso do botao", cfg.hardPulse, 200, 1500, 50, "ms", nullptr),
+};
+
+const MenuItem itemsTg[] = {
+  M_NUM("Checar a cada", cfg.botInterval, 2, 15, 1, "s", nullptr),
+};
+
+const MenuItem itemsSys[] = {
+  M_CHO("Reinicio auto", cfg.restartIdx, CH_RESTART, nullptr),
+};
+
+// --- STATUS (somente leitura) ---
+const MenuItem itemsStatus[] = {
+  M_SCR("Resumo (tela)", SCR_STATUS),
+  M_SUB("Rede",    menuNet),
+  M_SUB("PC",      menuPcInfo),
+  M_SUB("Sistema", menuSysInfo),
+};
+
+const MenuItem itemsNet[] = {
+  M_INF(infoIP),
+  M_INF(infoSSID),
+  M_INF(infoRSSI),
+};
+
+const MenuItem itemsPcInfo[] = {
+  M_INF(infoPcState),
+  M_INF(infoPcPing),
+  M_INF(infoLastCmd),
+};
+
+const MenuItem itemsSysInfo[] = {
+  M_INF(infoUptime),
+  M_INF(infoHeap),
+  M_INF(infoVersion),
+};
+
+// --- MANUTENCAO ---
+const MenuItem itemsMaint[] = {
+  M_ACT("Reiniciar ESP32",    actionReboot,          CONF_ASK, "O ESP32 vai reiniciar"),
+  M_ACT("Abrir portal WiFi",  actionPortal,          CONF_ASK, "Abre AP p/ config WiFi"),
+  M_ACT("Apagar WiFi salvo",  actionEraseWifi,       CONF_ASK, "Apaga WiFi e reinicia"),
+  M_ACT("Restaurar padroes",  actionRestoreDefaults, CONF_ASK, "Volta ao padrao"),
+};
+
+#define COUNT_OF(a) ((uint8_t)(sizeof(a) / sizeof((a)[0])))
+
+const Menu menuMain    = { "MENU",               itemsMain,    COUNT_OF(itemsMain) };
+const Menu menuPc      = { "CONTROLE DO PC",     itemsPc,      COUNT_OF(itemsPc) };
+const Menu menuCfg     = { "CONFIGURACOES",      itemsCfg,     COUNT_OF(itemsCfg) };
+const Menu menuLed     = { "CONFIG > LED",       itemsLed,     COUNT_OF(itemsLed) };
+const Menu menuDisplay = { "CONFIG > DISPLAY",   itemsDisplay, COUNT_OF(itemsDisplay) };
+const Menu menuHard    = { "CONFIG > HARD WOL",  itemsHard,    COUNT_OF(itemsHard) };
+const Menu menuTg      = { "CONFIG > TELEGRAM",  itemsTg,      COUNT_OF(itemsTg) };
+const Menu menuSys     = { "CONFIG > SISTEMA",   itemsSys,     COUNT_OF(itemsSys) };
+const Menu menuStatus  = { "STATUS",             itemsStatus,  COUNT_OF(itemsStatus) };
+const Menu menuNet     = { "STATUS > REDE",      itemsNet,     COUNT_OF(itemsNet) };
+const Menu menuPcInfo  = { "STATUS > PC",        itemsPcInfo,  COUNT_OF(itemsPcInfo) };
+const Menu menuSysInfo = { "STATUS > SISTEMA",   itemsSysInfo, COUNT_OF(itemsSysInfo) };
+const Menu menuMaint   = { "MANUTENCAO",         itemsMaint,   COUNT_OF(itemsMaint) };
+
+// =====================================================
+//  MOTOR DO MENU
+// =====================================================
+
+void navOpenRoot()
+{
+  navDepth = 0;
+  navStack[0] = Nav{ &menuMain, 0, 0 };
+}
+
+void navPush(const Menu *m)
+{
+  if (navDepth < 4)
+  {
+    navDepth++;
+    navStack[navDepth] = Nav{ m, 0, 0 };
+  }
+}
+
+// O menu tem count itens + 1 linha virtual "< Voltar" (indice == count)
+void menuClamp(Nav &n)
+{
+  if (n.cur < n.top) n.top = n.cur;
+  if (n.cur >= n.top + MENU_ROWS) n.top = n.cur - MENU_ROWS + 1;
+}
+
+String itemValue(const MenuItem &it)
+{
+  switch (it.type)
+  {
+    case IT_TOGGLE:  return *it.value ? "SIM" : "NAO";
+    case IT_NUMBER:  return String(*it.value) + (it.unit ? it.unit : "");
+    case IT_CHOICE:  return it.choices[*it.value];
+    case IT_SUBMENU: return ">";
+    default:         return "";
+  }
+}
+
+String menuRowText(const MenuItem &it)
+{
+  if (it.type == IT_INFO) return it.info();
+
+  String left = it.label;
+  String right = itemValue(it);
+
+  int pad = MAX_COLS - (int)left.length() - (int)right.length();
+  if (pad < 1) pad = 1;
+
+  String s = left;
+  for (int i = 0; i < pad; i++) s += ' ';
+  s += right;
+  return s;
+}
+
+void confirmStart(const String &l1, const String &l2, void (*yes)(), uint8_t ret)
+{
+  cfmL1 = l1;
+  cfmL2 = l2;
+  cfmYes = yes;
+  cfmFocus = 0;            // comeca em [Nao]
+  cfmReturn = ret;
+  gotoScreen(SCR_CONFIRM);
+}
+
+void menuBack()
+{
+  if (navDepth > 0) navDepth--;
+  else gotoScreen(SCR_HOME);
+  uiRedraw();
+}
+
+void editStart(const MenuItem &it)
+{
+  editItem = &it;
+  editBackup = *it.value;
+  editFocus = 0;
+  editing = true;
+  gotoScreen(SCR_EDIT);
+}
+
+void cancelEdit()
+{
+  if (editing && editItem)
+  {
+    *editItem->value = editBackup;
+    if (editItem->onChange) editItem->onChange();
+  }
+  editing = false;
+}
+
+void adjustValue(const MenuItem &it, int dir)
+{
+  bool isChoice = (it.type == IT_CHOICE);
+  int lo = isChoice ? 0 : it.minV;
+  int hi = isChoice ? it.nChoices - 1 : it.maxV;
+  int st = isChoice ? 1 : it.step;
+
+  int v = *it.value + dir * st;
+  if (v > hi) v = isChoice ? lo : hi;
+  if (v < lo) v = isChoice ? hi : lo;
+
+  *it.value = v;
+  if (it.onChange) it.onChange();
+}
+
+void activate(const MenuItem &it)
+{
+  switch (it.type)
+  {
+    case IT_SUBMENU:
+      navPush(it.submenu);
+      break;
+
+    case IT_SCREEN:
+      gotoScreen(it.screen);
+      break;
+
+    case IT_TOGGLE:
+      *it.value = !*it.value;
+      if (it.onChange) it.onChange();
+      saveSettings();
+      break;
+
+    case IT_NUMBER:
+    case IT_CHOICE:
+      editStart(it);
+      break;
+
+    case IT_ACTION:
+      if (it.confirm == CONF_NONE) it.action();
+      else confirmStart(String(it.label) + "?", it.confirmMsg ? it.confirmMsg : "", it.action, SCR_MENU);
+      break;
+
+    default:
+      break;
+  }
+}
+
+// =====================================================
+//  TELAS  (titulo + desenho + teclas)
+// =====================================================
+
+// --- HOME: log com rolagem ---
+String titleHome() { return oledHeader; }
+
+void drawHome()
+{
+  for (int i = 0; i < MAX_LINES; i++) uiRow(1 + i, logLines[i], false);
+}
+
+void keyHome(Key k)
+{
+  switch (k)
+  {
+    case K_OK:
+      navOpenRoot();
+      gotoScreen(SCR_MENU);
+      break;
+    case K_UP:    // atalho: Soft WoL (com confirmacao)
+      confirmStart("Enviar Soft WoL?", "Magic packet ao PC", actionSoftWol, SCR_HOME);
+      break;
+    case K_DOWN:  // atalho: ping
+      actionPing();
+      break;
+    default:
+      break;
+  }
+}
+
+// --- STATUS: resumo do PC ---
+String titleStatus() { return "RESUMO"; }
+
+void drawStatus()
+{
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 12);
+  display.print("PC ");
+  display.print(pcState == 1 ? "ONLINE" : (pcState == 0 ? "OFFLINE" : "???"));
+  display.setTextSize(1);
+
+  uiRow(4, "Ping: " + agoStr(lastPingTime), false);
+  uiRow(5, "Cmd: " + lastCmd, false);
+  uiRow(6, "WiFi: " + String(WiFi.RSSI()) + " dBm", false);
+  uiFooter("OK=Voltar    v=Ping");
+}
+
+void keyStatus(Key k)
+{
+  switch (k)
+  {
+    case K_OK:
+      gotoScreen(SCR_MENU);
+      break;
+    case K_DOWN:
+      actionPing();
+      uiRedraw();
+      break;
+    default:
+      break;
+  }
+}
+
+// --- MENU ---
+String titleMenu() { return navStack[navDepth].m->title; }
+
+void drawMenu()
+{
+  Nav &n = navStack[navDepth];
+  const Menu *m = n.m;
+
+  for (int r = 0; r < MENU_ROWS; r++)
+  {
+    int idx = n.top + r;
+    if (idx > m->count) break;
+    bool sel = (idx == n.cur);
+
+    if (idx == m->count) uiRow(1 + r, navDepth == 0 ? "< Inicio" : "< Voltar", sel);
+    else                 uiRow(1 + r, menuRowText(m->items[idx]), sel);
+  }
+
+  uiFooter("^v Move    OK=Entrar");
+}
+
+void keyMenu(Key k)
+{
+  Nav &n = navStack[navDepth];
+  const Menu *m = n.m;
+  uint8_t total = m->count + 1;   // itens + "< Voltar"
+
+  switch (k)
+  {
+    case K_UP:
+      n.cur = (n.cur == 0) ? total - 1 : n.cur - 1;
+      menuClamp(n);
+      break;
+    case K_DOWN:
+      n.cur = (n.cur + 1 >= total) ? 0 : n.cur + 1;
+      menuClamp(n);
+      break;
+    case K_OK:
+      if (n.cur >= m->count) { menuBack(); return; }
+      activate(m->items[n.cur]);
+      break;
+    default:
+      break;
+  }
+  uiRedraw();
+}
+
+// --- EDICAO: valor -> [Salvar] -> [Cancelar] ---
+String titleEdit()
+{
+  if (!editItem || !editItem->label) return "EDITAR";
+  String s = editItem->label;
+  s.toUpperCase();
+  return s;
+}
+
+void drawEdit()
+{
+  if (!editItem) return;
+  const MenuItem &it = *editItem;
+
+  // Valor em fonte grande, centralizado. Com foco, fica invertido.
+  String v = "< " + itemValue(it) + " >";
+  int w = v.length() * 12;
+  int x = (SCREEN_W - w) / 2;
+  if (x < 0) x = 0;
+
+  display.setTextSize(2);
+  if (editFocus == 0)
+  {
+    display.fillRect(0, 13, SCREEN_W, 18, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+  }
+  else
+  {
+    display.setTextColor(SSD1306_WHITE);
+  }
+  display.setCursor(x, 14);
+  display.print(v);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Faixa de valores
+  if (it.type == IT_NUMBER)
+    uiRow(4, "Faixa: " + String(it.minV) + " a " + String(it.maxV) + (it.unit ? it.unit : ""), false);
+  else
+    uiRow(4, "Opcao " + String(*it.value + 1) + " de " + String(it.nChoices), false);
+
+  uiButton(6, 44, "[Salvar]", editFocus == 1);
+  uiButton(64, 44, "[Cancelar]", editFocus == 2);
+
+  uiFooter(editFocus == 0 ? "^v Ajusta  OK=Proximo" : "^v Move    OK=Escolhe");
+}
+
+void keyEdit(Key k)
+{
+  if (!editItem) { gotoScreen(SCR_MENU); return; }
+  const MenuItem &it = *editItem;
+
+  switch (editFocus)
+  {
+    case 0:  // valor
+      if (k == K_UP)   adjustValue(it, +1);
+      if (k == K_DOWN) adjustValue(it, -1);
+      if (k == K_OK)   editFocus = 1;
+      break;
+
+    case 1:  // [Salvar]
+      if (k == K_UP)   editFocus = 0;
+      if (k == K_DOWN) editFocus = 2;
+      if (k == K_OK)
+      {
+        editing = false;
+        saveSettings();
+        gotoScreen(SCR_MENU);
+        return;
+      }
+      break;
+
+    case 2:  // [Cancelar]
+      if (k == K_UP)   editFocus = 1;
+      if (k == K_DOWN) editFocus = 0;
+      if (k == K_OK)
+      {
+        cancelEdit();
+        gotoScreen(SCR_MENU);
+        return;
+      }
+      break;
+  }
+  uiRedraw();
+}
+
+// --- CONFIRMACAO: [Nao] [Sim] ---
+String titleConfirm() { return "CONFIRMAR"; }
+
+void drawConfirm()
+{
+  uiRow(2, cfmL1, false);
+  uiRow(3, cfmL2, false);
+  uiButton(22, 44, "[Nao]", cfmFocus == 0);
+  uiButton(78, 44, "[Sim]", cfmFocus == 1);
+  uiFooter("^v Move    OK=Escolhe");
+}
+
+void keyConfirm(Key k)
+{
+  if (k == K_UP || k == K_DOWN)
+  {
+    cfmFocus = cfmFocus ? 0 : 1;
+    uiRedraw();
+    return;
+  }
+
+  if (k == K_OK)
+  {
+    bool yes = (cfmFocus == 1);
+    gotoScreen(cfmReturn);
+    if (yes && cfmYes) cfmYes();
+  }
+}
+
+// =====================================================
+//  TABELA DE TELAS  (para criar outra tela, acrescente uma linha)
+// =====================================================
+
+const ScreenDef SCREENS[SCR_COUNT] = {
+  /* SCR_HOME    */ { titleHome,    drawHome,    keyHome },
+  /* SCR_STATUS  */ { titleStatus,  drawStatus,  keyStatus },
+  /* SCR_MENU    */ { titleMenu,    drawMenu,    keyMenu },
+  /* SCR_EDIT    */ { titleEdit,    drawEdit,    keyEdit },
+  /* SCR_CONFIRM */ { titleConfirm, drawConfirm, keyConfirm },
+};
+
+void uiRedraw()
+{
+  if (!oledOk || !displayAwake) return;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+
+  // Cabecalho: faixa branca com texto preto
+  display.fillRect(0, 0, SCREEN_W, 8, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setCursor(1, 0);
+  display.print(SCREENS[curScreen].title().substring(0, MAX_COLS - 1));
+  display.setTextColor(SSD1306_WHITE);
+
+  SCREENS[curScreen].draw();
+
+  if (noticeActive && curScreen != SCR_HOME) uiRow(7, noticeText, true);
+
+  display.display();
+}
+
+void gotoScreen(uint8_t id)
+{
+  curScreen = id;
+  uiRedraw();
+}
+
+// =====================================================
+//  TELEGRAM
+// =====================================================
+
+void handleNewMessages(int numNewMessages)
+{
+  Serial.print("Novas mensagens: ");
+  Serial.println(numNewMessages);
+
+  for (int i = 0; i < numNewMessages; ++i)
+  {
+    String chat_id = bot.messages[i].chat_id;
+    String text = bot.messages[i].text;
+    String from_id = bot.messages[i].from_id;
+    String from_name = bot.messages[i].from_name;
+
+    // Ignora estranhos em silencio (so registra e avisa no LED)
+    if (from_id != ALLOWED_ID)
+    {
+      oledLog("NEGADO: " + from_id);
+      ledFlash(C_RED, 3);
+      continue;
+    }
+
+    if (bot.messages[i].type == "callback_query")
+    {
+      bot.answerCallbackQuery(bot.messages[i].query_id);
+    }
+
+    if (from_name == "") from_name = "Visitante";
+
+    lastCmd = text;
+    lastCmdTime = millis();
+    oledLog("RX: " + text);
+    ledInfoFlash(C_WHITE, 1, 80, 0);
+
+    if (text == "/start")
+    {
+      String welcome = "Olá " + from_name + "! Painel de Controle do PC.\nEscolha uma opção abaixo:";
+      String inlineJson = "[[{\"text\":\"🪄 Ligar (Soft WoL)\",\"callback_data\":\"/wol_soft\"},"
+                          "{\"text\":\"⚡ Ligar (Hard WoL)\",\"callback_data\":\"/wol_hard\"}],"
+                          "[{\"text\":\"🔍 Status do PC\",\"callback_data\":\"/ping\"}]]";
+      bot.sendMessageWithInlineKeyboard(chat_id, welcome, "", inlineJson);
+      oledLog("TX: menu enviado");
+    }
+    else if (text == "/wol_soft")
+    {
+      sendWolSoft();
+      reply(chat_id, "🪄 Magic Packet (Soft WoL) enviado para a rede!", "Soft WoL enviado");
+    }
+    else if (text == "/wol_hard")
+    {
+      sendWolHard();
+      reply(chat_id, "⚡ Placa-mãe acionada fisicamente (Hard WoL)!", "Hard WoL acionado");
+    }
+    else if (text == "/ping")
+    {
+      reply(chat_id, "🔍 Checando status do PC, aguarde...", "Checando PC...");
+      bool isOnline = pingPc();
+      if (isOnline)
+        reply(chat_id, "✅ *O PC está LIGADO (ONLINE)!*", "PC ONLINE", "Markdown");
+      else
+        reply(chat_id, "❌ *O PC está DESLIGADO (OFFLINE).*", "PC OFFLINE", "Markdown");
+    }
+    else
+    {
+      ledInfoFlash(C_YELLOW, 2);
+      reply(chat_id, "Comando não reconhecido. Use o menu ou digite /start", "Comando invalido");
+    }
+  }
+}
+
+// =====================================================
+//  SETUP E LOOP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(HARD_WOL_PIN, OUTPUT);
+  digitalWrite(HARD_WOL_PIN, HARD_IDLE_LEVEL);
+
+  pinMode(BTN_UP_PIN, INPUT_PULLUP);
+  pinMode(BTN_OK_PIN, INPUT_PULLUP);
+  pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
+
+  loadSettings();
+
+  // --- LED ---
+  led.begin();
+  applyLed();
+  ledShow(C_BLUE); // iniciando
+
+  // --- OLED ---
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.beginTransmission(OLED_ADDR);
+  bool oledPresent = (Wire.endTransmission() == 0);
+
+  if (oledPresent && display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR))
+  {
+    oledOk = true;
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.clearDisplay();
+    display.display();
+    applyOled();
+  }
+  else
+  {
+    Serial.println("OLED nao encontrado, seguindo sem display");
+  }
+  lastActivity = millis();
+  lastKeyTime = millis();
+  oledLog("Iniciando...");
+
+  // --- WIFIMANAGER ---
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(180);
+  wm.setAPCallback(onApOpen);
+
+  oledLog("Conectando WiFi...");
+  ledShow(C_YELLOW);
+
+  bool res = wm.autoConnect(AP_NAME, apPass());
+
+  if (!res)
+  {
+    oledLog("WiFi falhou. Reiniciando");
+    ledFlash(C_RED, 5);
+    delay(500);
+    ESP.restart();
+  }
+
+  oledLog("WiFi OK");
+  oledHeader = "IP:" + WiFi.localIP().toString();
+  uiRedraw();
+
+  secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+
+  WOL.calculateBroadcastAddress(WiFi.localIP(), WiFi.subnetMask());
+
+  oledLog("Sincronizando NTP...");
+  ledShow(C_CYAN);
+  configTime(0, 0, "pool.ntp.org");
+  time_t now = time(nullptr);
+  while (now < 24 * 3600)
+  {
+    delay(150);
+    now = time(nullptr);
+  }
+  oledLog("NTP OK");
+
+  bot.sendMessage(ALLOWED_ID, "🤖 Sistema ESP32 reiniciado e online! Digite /start para o menu.", "");
+  oledLog("Bot online");
+  ledFlash(C_GREEN, 2, 200, 150);
+}
+
+void loop()
+{
+  // Atualiza o cabecalho se o estado do Wi-Fi mudar
+  static wl_status_t lastStatus = WL_CONNECTED;
+  if (WiFi.status() != lastStatus)
+  {
+    lastStatus = WiFi.status();
+    oledHeader = (lastStatus == WL_CONNECTED) ? "IP:" + WiFi.localIP().toString()
+                                              : "WiFi desconectado";
+    uiRedraw();
+  }
+
+  // Botoes
+  Key k = pollButtons();
+  if (k != K_NONE && oledOk)
+  {
+    lastKeyTime = millis();
+    if (!displayAwake)
+    {
+      oledWake();     // o primeiro toque so acorda a tela
+      uiRedraw();
+    }
+    else
+    {
+      lastActivity = millis();
+      SCREENS[curScreen].onKey(k);
+    }
+  }
+
+  // Volta para a tela inicial apos inatividade (cancela edicao em andamento)
+  if (curScreen != SCR_HOME && millis() - lastKeyTime > MENU_TIMEOUT_MS)
+  {
+    cancelEdit();
+    gotoScreen(SCR_HOME);
+  }
+
+  // Apaga o OLED apos inatividade (configuravel)
+  unsigned long oledTo = OLED_TIMEOUT_MS[cfg.oledTimeout];
+  if (oledTo && displayAwake && millis() - lastActivity > oledTo) oledSleep();
+
+  // Expira o aviso de uma linha
+  if (noticeActive && millis() > noticeUntil)
+  {
+    noticeActive = false;
+    uiRedraw();
+  }
+
+  // Telegram
+  if (millis() - bot_lasttime > (unsigned long)cfg.botInterval * 1000UL)
+  {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    while (numNewMessages)
+    {
+      handleNewMessages(numNewMessages);
+      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    }
+    bot_lasttime = millis();
+  }
+
+  // Reinicio preventivo (configuravel)
+  unsigned long rs = RESTART_MS[cfg.restartIdx];
+  if (rs && millis() > rs)
+  {
+    oledLog("Reinicio preventivo");
+    ledFlash(C_PURPLE, 2);
+    delay(500);
+    ESP.restart();
+  }
+
+  ledUpdate();
+  delay(10);
+}
